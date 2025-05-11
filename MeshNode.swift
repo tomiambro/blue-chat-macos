@@ -9,7 +9,7 @@ import CoreBluetooth
 protocol ChatTransport {
     var onMessageReceived: ((String, String) -> Void)? { get set }
     func start()
-    func sendMessage(_ text: String)
+    func sendMessage(_ text: String, completion: @escaping (Bool) -> Void)
 }
 
 
@@ -36,17 +36,31 @@ class BluetoothManager: NSObject, ChatTransport {
         // Both central and peripheral will begin once state updates to poweredOn
     }
 
-    func sendMessage(_ text: String) {
-        guard let data = text.data(using: .utf8) else { return }
+    func sendMessage(_ text: String, completion: @escaping (Bool) -> Void) {
+        guard let data = text.data(using: .utf8) else {
+            completion(false)
+            return
+        }
+
+        var sent = false
 
         // Send as peripheral
-        peripheralManager.updateValue(data, for: chatCharacteristic, onSubscribedCentrals: nil)
+        if !subscribedCentrals.isEmpty {
+            let success = peripheralManager.updateValue(data, for: chatCharacteristic, onSubscribedCentrals: nil)
+            sent = sent || success
+        }
 
         // Send as central
+        var centralSuccess = false
         for (peripheral, characteristic) in chatCharacteristics {
             peripheral.writeValue(data, for: characteristic, type: .withResponse)
+            centralSuccess = true
         }
+
+        sent = sent || centralSuccess
+        completion(sent)
     }
+
 }
 
 // MARK: - Peripheral Role
@@ -158,14 +172,21 @@ class MultipeerManager: NSObject, ChatTransport {
         print("[Multipeer] Multipeer communication started as \(peerID.displayName)")
     }
 
-    func sendMessage(_ text: String) {
-        guard !session.connectedPeers.isEmpty else { return }
+    func sendMessage(_ text: String, completion: @escaping (Bool) -> Void) {
+        guard !session.connectedPeers.isEmpty else {
+            completion(false)
+            return
+        }
         if let data = text.data(using: .utf8) {
             do {
                 try session.send(data, toPeers: session.connectedPeers, with: .reliable)
+                completion(true)
             } catch {
-                print("[Multipeer] Error sending message: \(error)")
+                print("[Multipeer] Error sending: \(error)")
+                completion(false)
             }
+        } else {
+            completion(false)
         }
     }
 }
@@ -223,15 +244,20 @@ class WiFiDirectManager: ChatTransport {
         print("[WifiDirect] Starting Wi-Fi Direct communication (simulated with sockets on iOS/macOS)")
     }
 
-    func sendMessage(_ text: String) {
+    func sendMessage(_ text: String, completion: @escaping (Bool) -> Void) {
         guard let connection = connection else {
-            // print("[WifiDirect] No connection available.")
+            completion(false)
             return
         }
+
         let data = text.data(using: .utf8)
         connection.send(content: data, completion: .contentProcessed({ error in
             if let error = error {
                 print("[WifiDirect] Error sending message: \(error)")
+                completion(false)
+            }
+            else {
+                completion(true)
             }
         }))
     }
@@ -241,11 +267,11 @@ class WiFiDirectManager: ChatTransport {
 
 class CrossPlatformTransportManager: ChatTransport {
     private var transports: [ChatTransport] = []
+
     var onMessageReceived: ((String, String) -> Void)? {
         didSet {
-            // Use for-in loop to modify the property
-            for (var transport) in transports {
-                transport.onMessageReceived = onMessageReceived
+            for i in transports.indices {
+                transports[i].onMessageReceived = onMessageReceived
             }
         }
     }
@@ -254,7 +280,9 @@ class CrossPlatformTransportManager: ChatTransport {
         let wifiTransport = WiFiDirectManager()
         let multiTransport = MultipeerManager()
         let bluetoothTransport = BluetoothManager()
-        transports = [wifiTransport, multiTransport, bluetoothTransport]
+        transports.append(wifiTransport)
+        transports.append(multiTransport)
+        transports.append(bluetoothTransport)
     }
 
     func start() {
@@ -262,7 +290,31 @@ class CrossPlatformTransportManager: ChatTransport {
     }
 
     func sendMessage(_ text: String) {
-        transports.forEach { $0.sendMessage(text) }
+        sendMessage(text) { success in
+            if !success {
+                print("[TransportManager] Failed to send message on all transports.")
+            }
+        }
+    }
+
+    func sendMessage(_ text: String, completion: @escaping (Bool) -> Void) {
+        trySend(index: 0, text: text, completion: completion)
+    }
+
+    private func trySend(index: Int, text: String, completion: @escaping (Bool) -> Void) {
+        guard index < transports.count else {
+            completion(false)
+            return
+        }
+
+        transports[index].sendMessage(text) { success in
+            if success {
+                print("[TransportManager] Message sent via \(type(of: self.transports[index]))")
+                completion(true)
+            } else {
+                self.trySend(index: index + 1, text: text, completion: completion)
+            }
+        }
     }
 }
 
